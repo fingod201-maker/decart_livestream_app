@@ -1,0 +1,12 @@
+# Decart Livestream Studio - Python dependencies
+# Requires Python 3.10 or newer (the Decart SDK targets >= 3.10).
+
+# Decart SDK + LiveKit realtime stack (pulls in livekit + tenacity)
+decart[realtime]>=0.2.1
+
+# Camera capture / frame handling
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Image handling + Tkinter preview rendering
+Pillow>=10.0.0
