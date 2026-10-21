@@ -278,7 +278,7 @@ class DecartLivestreamApp:
         self.source_combo.bind("<<ComboboxSelected>>", lambda e: self._on_option_changed())
         cam_row = ttk.Frame(parent, style="Panel.TFrame")
         cam_row.pack(fill="x", pady=(4, 0))
-        ttk.Label(cam_row, text="Camera index:", style="Panel.TLabel").pack(side="left")
+        ttk.Label(cam_row, text="Color camera index (not IR):", style="Panel.TLabel").pack(side="left")
         self.camera_var = tk.IntVar(value=int(self.settings.get("camera_index", 0)))
         ttk.Spinbox(cam_row, from_=0, to=10, width=4, textvariable=self.camera_var).pack(side="left", padx=(6, 0))
 
@@ -592,6 +592,11 @@ class DecartLivestreamApp:
 
     def _set_state(self, state: str) -> None:
         self._state = state
+        if state == "disconnected":
+            self.engine.clear_frame()
+            self._last_frame = None
+            self._draw_preview()
+
         label, color = C.STATE_STYLES.get(state, (state, C.COLOR_TEXT_DIM))
         self.state_label.configure(text=label, fg=color)
         self.state_dot.configure(fg=color)

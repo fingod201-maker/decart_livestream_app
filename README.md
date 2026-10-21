@@ -145,9 +145,9 @@ pip install -r requirements.txt
 python app.py
 ```
 
-> The camera index and the DSHOW backend used for fast camera opening are
-> Windows-oriented, but the app also runs on macOS/Linux — the camera backend
-> simply falls back to the platform default.
+> Camera indices are assigned by the operating system and may include an IR
+> sensor before the color webcam. The app prefers the platform's default video
+> backend and falls back to DSHOW when needed.
 
 ---
 
@@ -200,9 +200,15 @@ in an unsupported format. A thumbnail preview is shown.
 > photo (skin tone, hair, clothing, distinctive features).
 
 ### 5 · Streaming description
-This is the prompt sent to Lucy. The app seeds it with a good default:
+This is the prompt sent to Lucy. The app seeds it with a character-substitution
+prompt that explicitly uses the live video for motion and the reference for
+identity:
 
-> *"Substitute the character in the video with the person in the reference image."*
+> *"Replace the live video person's appearance with the identity in the reference
+> image. The live video is the motion source: follow its head and body movement,
+> pose, facial expression, and speaking mouth motion in real time. Use the
+> reference image for identity and appearance only, not as the motion source.
+> Preserve natural proportions and framing."*
 
 Use the **Template** dropdown to insert one of the four supported edit types
 (from the official prompting guide), then fill in the blanks:
@@ -231,8 +237,10 @@ enhance flag together to keep them in sync.
 
 ### 6 · Video source
 - **Webcam (live camera)** — captures your camera and streams it to Decart. Set
-  the **Camera index** (0 is usually the built-in webcam; try 1, 2… for
-  external cameras).
+  the **Color camera index (not IR)**. Some PCs list an infrared sensor at
+  index 0 and the normal color webcam at index 1. The app waits for an actual
+  camera frame before connecting and logs its index, dimensions, backend, and
+  send frame rate.
 - **Reference picture (static)** — streams the chosen picture itself as a static
   feed. This is handy for testing without a camera, or for driving a purely
   prompt-based transformation of an image.
@@ -305,10 +313,10 @@ loop with `asyncio.run_coroutine_threadsafe`.
 
 Key implementation details:
 
-- **Input frames** are produced by a grabber (`WebcamGrabber` reads the camera on
-  its own thread; `PictureGrabber` re-emits a cached resized image). Frames are
-  center-cropped to the target aspect ratio and resized to the model size so the
-  stream is never distorted.
+- **Input frames** are produced by a grabber (`WebcamGrabber` requests 1920×1080
+  capture and reads the camera on its own thread; `PictureGrabber` re-emits a
+  cached resized image). Frames are center-cropped to the target aspect ratio
+  and resized to the model size so the stream is never distorted.
 - **Frame push** happens inside the async loop at exactly `model.fps`, using
   `rtc.VideoFrame(width, height, type=rtc.VideoBufferType.RGB24, data=...)`.
 - **Output frames** arrive via the `on_remote_stream` callback. Each frame is
@@ -317,6 +325,9 @@ Key implementation details:
   unavailable.
 - **Latency control** — only the *latest* frame is kept (old frames are dropped
   instead of queued), so the preview never drifts behind the live stream.
+- **Output-track lifecycle** — each remote video track has one consumer, and
+  consumers are cancelled and awaited when the session disconnects so an old
+  stream cannot keep updating the preview after reconnect.
 - **Lifecycle** — `initial_state` (prompt + reference image) is passed to
   `connect()` so the very first generated frame is already transformed, avoiding
   the brief raw-camera flash the docs warn about. On disconnect the app calls
@@ -402,6 +413,13 @@ The API key is wrong, expired, or has no credits. Create a fresh key at
 Another app may be using the camera, or the index is wrong. Close other camera
 apps and try index 1 or 2. You can also switch the source to *Reference picture
 (static)* to confirm the pipeline works without a camera.
+
+**The reference image moves, but not with the webcam**
+Make sure the source is **Webcam (live camera)** and select the color camera,
+not an IR/depth camera. Many PCs expose the IR sensor as index 0 and the color
+webcam as index 1. Check the startup log for `Live camera <index>` to confirm
+which device is streaming. The live prompt should specify that the webcam
+provides motion while the reference image provides identity.
 
 **Stream is slow / choppy**
 Switch the output quality to `720p`, close bandwidth-heavy apps, and prefer a

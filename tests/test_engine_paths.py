@@ -3,6 +3,7 @@ construction without making a network connection."""
 import asyncio
 import os
 import sys
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -15,6 +16,45 @@ from decart.types import ModelState, Prompt
 from livekit import rtc
 
 from decart_engine import DecartEngine
+
+
+async def verify_remote_stream_lifecycle():
+    class BlockingVideoStream:
+        def __init__(self, _track):
+            self.closed = False
+            self.started = asyncio.Event()
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self.started.set()
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            self.closed = True
+
+    engine = DecartEngine(lambda _kind, _payload: None)
+    track = type("Track", (), {"sid": "test-track"})()
+    streams = []
+
+    def make_stream(_track):
+        stream = BlockingVideoStream(_track)
+        streams.append(stream)
+        return stream
+
+    with patch.object(rtc, "VideoStream", make_stream):
+        engine._on_remote_stream(track)
+        engine._on_remote_stream(track)
+        await asyncio.sleep(0)
+        assert len(engine._remote_stream_tasks) == 1
+        assert len(streams) == 1
+        assert streams[0].started.is_set()
+        await engine._stop_remote_streams()
+
+    assert not engine._remote_stream_tasks
+    assert streams[0].closed
+    print("remote stream deduplication + cleanup OK")
 
 
 async def main():
@@ -65,6 +105,8 @@ async def main():
     pil_i420 = DecartEngine._frame_to_image(i420, rtc)
     assert pil_i420 is not None and pil_i420.size == (w, h)
     print("engine I420 -> PIL OK:", pil_i420.size)
+
+    await verify_remote_stream_lifecycle()
 
     await source.aclose()
     await p_source.aclose()

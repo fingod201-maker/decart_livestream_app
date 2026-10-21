@@ -93,8 +93,13 @@ PROMPT_TEMPLATES = {
         "Change <object to change attribute of> to <description of the new attribute>."
     ),
 }
-DEFAULT_PROMPT = ("Substitute the character in the video with the person in the "
-                  "reference image.")
+DEFAULT_PROMPT = (
+    "Replace the live video person's appearance with the identity in the reference "
+    "image. The live video is the motion source: follow its head and body movement, "
+    "pose, facial expression, and speaking mouth motion in real time. Use the "
+    "reference image for identity and appearance only, not as the motion source. "
+    "Preserve natural proportions and framing."
+)
 
 # --------------------------------------------------------------------------- #
 # UI palette (dark, modern)

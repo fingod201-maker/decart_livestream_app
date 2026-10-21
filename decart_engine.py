@@ -94,6 +94,9 @@ class BaseGrabber:
     def stop(self) -> None:  # pragma: no cover
         pass
 
+    def wait_until_ready(self, timeout: float = 10.0) -> bool:
+        return True
+
 
 class WebcamGrabber(BaseGrabber):
     """Reads a live camera on a background thread and keeps the latest frame."""
@@ -107,20 +110,35 @@ class WebcamGrabber(BaseGrabber):
         self._running = False
         self._size = (0, 0)
         self._error: Optional[str] = None
+        self._frame_ready = threading.Event()
+        self._backend_name: Optional[str] = None
+        self._frame_size: Optional[tuple[int, int]] = None
 
     def start(self, width: int, height: int) -> None:
         self._size = (width, height)
+        self._error = None
+        self._frame_ready.clear()
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="webcam", daemon=True)
         self._thread.start()
 
     def _open_camera(self, cv2):
-        # CAP_DSHOW opens much faster on Windows; fall back to the default
-        # backend everywhere else (or if DSHOW is unavailable).
-        for backend in (getattr(cv2, "CAP_DSHOW", 700), None):
+        # Prefer the Windows default (usually Media Foundation); DSHOW may fail
+        # on some cameras even when another backend can read them.
+        for backend in (None, getattr(cv2, "CAP_DSHOW", 700)):
             try:
-                cap = cv2.VideoCapture(self.camera_index, backend) if backend else cv2.VideoCapture(self.camera_index)
+                cap = (
+                    cv2.VideoCapture(self.camera_index, backend)
+                    if backend is not None
+                    else cv2.VideoCapture(self.camera_index)
+                )
                 if cap is not None and cap.isOpened():
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+                    try:
+                        self._backend_name = cap.getBackendName()
+                    except Exception:
+                        self._backend_name = "unknown"
                     return cap
                 if cap is not None:
                     cap.release()
@@ -129,20 +147,20 @@ class WebcamGrabber(BaseGrabber):
         return None
 
     def _loop(self) -> None:
-        import cv2  # local import keeps module import light
-
-        cap = self._open_camera(cv2)
-        if cap is None:
-            self._error = f"Could not open camera index {self.camera_index}"
-            self._running = False
-            return
-        self._cap = cap
         try:
+            import cv2  # local import keeps module import light
+
+            cap = self._open_camera(cv2)
+            if cap is None:
+                self._error = f"Could not open camera index {self.camera_index}"
+                return
+            self._cap = cap
             while self._running:
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     time.sleep(0.005)
                     continue
+                self._frame_size = (frame.shape[1], frame.shape[0])
                 w, h = self._size
                 if w and h:
                     x0, y0, x1, y1 = _crop_box(frame.shape[1], frame.shape[0], w, h)
@@ -151,11 +169,27 @@ class WebcamGrabber(BaseGrabber):
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 with self._lock:
                     self._latest = frame
+                self._frame_ready.set()
+        except Exception as exc:
+            self._error = f"Camera index {self.camera_index} capture failed: {exc}"
         finally:
+            self._running = False
+            self._frame_ready.set()
+            cap = self._cap
             try:
-                cap.release()
+                if cap is not None:
+                    cap.release()
             except Exception:
                 pass
+
+    def wait_until_ready(self, timeout: float = 10.0) -> bool:
+        if not self._frame_ready.wait(timeout):
+            self._error = (
+                f"Camera index {self.camera_index} opened but did not provide a video frame "
+                f"within {timeout:g} seconds."
+            )
+            return False
+        return self._latest is not None
 
     def get_frame(self, width: int, height: int) -> Optional[bytes]:
         with self._lock:
@@ -215,6 +249,7 @@ class DecartEngine:
         self._source = None              # livekit VideoSource
         self._grabber: Optional[BaseGrabber] = None
         self._capture_task: Optional[asyncio.Task] = None
+        self._remote_stream_tasks: dict[object, asyncio.Task] = {}
 
         self._stop_requested = threading.Event()
         self._session_active = False
@@ -374,6 +409,17 @@ class DecartEngine:
                 )
 
                 grabber.start(width, height)
+                if not await asyncio.to_thread(grabber.wait_until_ready, 10.0):
+                    raise RuntimeError(
+                        getattr(grabber, "error", None)
+                        or "The selected camera did not provide a live video frame."
+                    )
+                if isinstance(grabber, WebcamGrabber):
+                    frame_width, frame_height = grabber._frame_size or (width, height)
+                    self._log(
+                        f"Live camera {grabber.camera_index}: {frame_width}x{frame_height} "
+                        f"via {grabber._backend_name}; sending frames at {model.fps} fps"
+                    )
 
                 source = rtc.VideoSource(width, height)
                 local_track = rtc.LocalVideoTrack.create_video_track("input", source)
@@ -437,6 +483,7 @@ class DecartEngine:
                 except (asyncio.CancelledError, Exception):
                     pass
                 self._capture_task = None
+            await self._stop_remote_streams()
             if grabber is not None:
                 try:
                     grabber.stop()
@@ -452,6 +499,7 @@ class DecartEngine:
             self._realtime = None
             self._connected = False
             self._session_active = False
+            self.clear_frame()
             self._emit(EVT_STATE, "disconnected")
             self._emit(EVT_STATUS, "Disconnected")
 
@@ -527,6 +575,11 @@ class DecartEngine:
     def _on_remote_stream(self, track) -> None:
         from livekit import rtc
 
+        track_id = getattr(track, "sid", None) or id(track)
+        existing_task = self._remote_stream_tasks.get(track_id)
+        if existing_task is not None and not existing_task.done():
+            return
+
         async def consume():
             stream = rtc.VideoStream(track)
             try:
@@ -546,7 +599,23 @@ class DecartEngine:
                 except Exception:
                     pass
 
-        asyncio.create_task(consume())
+        task = asyncio.create_task(consume(), name=f"remote-video-{track_id}")
+        self._remote_stream_tasks[track_id] = task
+
+        def forget_task(done_task: asyncio.Task) -> None:
+            if self._remote_stream_tasks.get(track_id) is done_task:
+                self._remote_stream_tasks.pop(track_id, None)
+
+        task.add_done_callback(forget_task)
+
+    async def _stop_remote_streams(self) -> None:
+        """Cancel and await every output-track consumer before the loop exits."""
+        tasks = list(self._remote_stream_tasks.values())
+        self._remote_stream_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @staticmethod
     def _frame_to_image(frame, rtc) -> Optional[Image.Image]:
